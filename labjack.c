@@ -32,6 +32,10 @@ static ssize_t bchr_read(struct file *file, char __user *buf,
 static int chr_open(struct inode *inode, struct file *file);
 
 
+static ssize_t achr_read(struct file *file, char __user *buf, 
+		  size_t size, loff_t *off)
+
+
 static ssize_t cchr_read(struct file *file, char __user *buf, 
 		  size_t size, loff_t *off);
 
@@ -40,6 +44,13 @@ static ssize_t cchr_read(struct file *file, char __user *buf,
 static int lj_probe(struct usb_interface *intf, const struct usb_device_id *id);
 
 static void lj_disconnect(struct usb_interface *intf);
+
+static struct file_operations achr_ops = {
+  .owner = THIS_MODULE,
+  .read = achr_read,
+  .open = chr_open,
+};
+
 
 static struct file_operations bchr_ops = {
   .owner = THIS_MODULE,
@@ -53,6 +64,7 @@ static struct file_operations cchr_ops = {
   .read = cchr_read,
   .open = chr_open,
 };
+
 
 
 struct lj_state {
@@ -189,7 +201,7 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
 
   struct usb_device *usb_device;
   
-  struct lj_state *lj_state = NULL;
+  struct lj_state *curstate = NULL;
 
   int result;
   const int CFGSIZE = 12;
@@ -216,9 +228,9 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
   
   printk(KERN_INFO "You were probed!!!\n");
 
-  lj_state = kzalloc(sizeof(struct lj_state), GFP_KERNEL);
+  curstate = kzalloc(sizeof(struct lj_state), GFP_KERNEL);
   
-  if(!lj_state)
+  if(!curstate)
     {
       printk( KERN_INFO "Could not allocate memory for labjack state!!!\n");
       goto error;
@@ -226,23 +238,23 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
   
   usb_device = interface_to_usbdev(intf);
   
-  lj_state->usb_device = usb_device;
+  curstate->usb_device = usb_device;
 
-  lj_state->hw_lock = NULL;
-  lj_state->hw_lock = kmalloc(sizeof(struct mutex), GFP_KERNEL);
+  curstate->hw_lock = NULL;
+  curstate->hw_lock = kmalloc(sizeof(struct mutex), GFP_KERNEL);
   
-  if(lj_state->hw_lock == NULL)
+  if(curstate->hw_lock == NULL)
     {
       printk(KERN_INFO "Could not allocate memory for hardware mutex!\n");
       goto err_free;
     }
   
-  mutex_init(lj_state->hw_lock);
+  mutex_init(curstate->hw_lock);
   
-  usb_set_intfdata(intf, lj_state);
+  usb_set_intfdata(intf, curstate);
   
-  result = usb_bulk_msg(lj_state->usb_device, 
-			usb_sndbulkpipe(lj_state->usb_device, 1),
+  result = usb_bulk_msg(curstate->usb_device, 
+			usb_sndbulkpipe(curstate->usb_device, 1),
 			config_packet, CFGSIZE, &sent_len, 5);
   
 
@@ -252,8 +264,8 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
       goto err_hwlock;
     }
 
-  result = usb_bulk_msg(lj_state->usb_device, 
-			usb_rcvbulkpipe(lj_state->usb_device, 2),
+  result = usb_bulk_msg(curstate->usb_device, 
+			usb_rcvbulkpipe(curstate->usb_device, 2),
 			rcv_packet, RCVSIZE, &sent_len, 5);
   if(result)
   {
@@ -269,7 +281,7 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
     }
   printk(KERN_INFO "EIN2 configure as AIN9\n");
   
-  minor = insert_state_table(lj_state);
+  minor = insert_state_table(curstate);
   if(minor < 0)
     {
       printk(KERN_INFO "could not add usb_interface to interface table!\n");
@@ -279,12 +291,12 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
   devid = minor - MINOR_START;
   tmpname = kmalloc(sizeof(char)*LJ_NAMESIZE, GFP_KERNEL);
   sprintf(tmpname, "lab%dportB",devid);
-  lj_state->bchr_device.name = tmpname;
-  lj_state->bchr_device.minor = minor + 1; /* b's minor is start minor + 1 */
-  lj_state->bchr_device.fops = &bchr_ops;
+  curstate->bchr_device.name = tmpname;
+  curstate->bchr_device.minor = minor + 1; /* b's minor is start minor + 1 */
+  curstate->bchr_device.fops = &bchr_ops;
 
 
-  result = misc_register(&lj_state->bchr_device);
+  result = misc_register(&curstate->bchr_device);
   
   if(result)
     {
@@ -299,12 +311,12 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
 
   tmpname = kmalloc(sizeof(char)*LJ_NAMESIZE, GFP_KERNEL);
   sprintf(tmpname, "lab%dportC",devid);
-  lj_state->cchr_device.name = tmpname;
-  lj_state->cchr_device.minor = minor + 2; /* c's minor is start minor + 1 */
-  lj_state->cchr_device.fops = &cchr_ops;
+  curstate->cchr_device.name = tmpname;
+  curstate->cchr_device.minor = minor + 2; /* c's minor is start minor + 1 */
+  curstate->cchr_device.fops = &cchr_ops;
 
 
-  result = misc_register(&lj_state->cchr_device);
+  result = misc_register(&curstate->cchr_device);
   
   if(result)
     {
@@ -321,16 +333,16 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
   return 0;
   
  err_regb:
-  misc_deregister(&lj_state->bchr_device);
-  kfree(lj_state->bchr_device.name);
+  misc_deregister(&curstate->bchr_device);
+  kfree(curstate->bchr_device.name);
  err_intf:
   remove_state_table(minor);
  err_hwlock:
-  mutex_destroy(lj_state->hw_lock);
-  kfree(lj_state->hw_lock);
+  mutex_destroy(curstate->hw_lock);
+  kfree(curstate->hw_lock);
  err_free:
   usb_set_intfdata(intf, NULL);
-  kfree(lj_state);
+  kfree(curstateq);
   
  error:
   return -1;
@@ -470,6 +482,14 @@ static ssize_t bchr_read(struct file *file, char __user *buf,
   
  error:
   mutex_unlock(lj_state->hw_lock);
+  return -EINVAL;
+}
+
+
+static ssize_t achr_read(struct file *file, char __user *buf, 
+		  size_t size, loff_t *off)
+{
+  printk(KERN_INFO "Someone tried to read on portA!\n");
   return -EINVAL;
 }
 
