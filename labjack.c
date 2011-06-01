@@ -22,7 +22,7 @@ static struct lj_state **lj_state_table = NULL;
 
 /* this lock protects the character device registering from stepping
    on the allocation of the numbers. */
-static struct mutex probe_lock;
+static struct mutex state_table_lock;
 
 
 static ssize_t bchr_read(struct file *file, char __user *buf, 
@@ -107,19 +107,19 @@ static int insert_state_table(struct lj_state *state)
 {
   int i;
   
-  mutex_lock(&probe_lock);
+  mutex_lock(&state_table_lock);
 
   for(i = 0; i < MAXDEV; i++)
     {
       if(!lj_state_table[i])
 	{
 	  lj_state_table[i] = state;
-	  mutex_unlock(&probe_lock);
+	  mutex_unlock(&state_table_lock);
 	  return i*LJ_NUM_MINORS + MINOR_START;
 	}
     }
   /* if we have gotten here, there is no more room to register a device. */
-  mutex_unlock(&probe_lock);
+  mutex_unlock(&state_table_lock);
   return -1;
   
 }
@@ -135,16 +135,16 @@ static int remove_state_table(int minor)
 	     minor);
       return -1;
     }
-  mutex_lock(&probe_lock);
+  mutex_lock(&state_table_lock);
   if(lj_state_table[index] == NULL)
     {
       printk(KERN_INFO "device is already NULL! cannot remove from" 
 	     "interface table.\n");
-      mutex_unlock(&probe_lock);
+      mutex_unlock(&state_table_lock);
       return -1;
     }
   lj_state_table[index] = NULL;
-  mutex_unlock(&probe_lock);
+  mutex_unlock(&state_table_lock);
   return 0;  
 }
 
@@ -160,9 +160,9 @@ static struct lj_state* get_lj_state(int minor)
 	     minor);
       return NULL;
     }
-  mutex_lock(&probe_lock);
+  mutex_lock(&state_table_lock);
   state = lj_state_table[index]; 
-  mutex_unlock(&probe_lock);
+  mutex_unlock(&state_table_lock);
   return state;
 }
 
@@ -508,7 +508,7 @@ static int __init lj_start(void)
       printk(KERN_INFO "Could not register device: %d", result);
       goto error_reg;
     }
-  mutex_init(&probe_lock);
+  mutex_init(&state_table_lock);
   return 0;
  error_reg:
   kfree(lj_state_table);
@@ -523,7 +523,7 @@ static void __exit lj_end(void)
 
   usb_deregister(&usb_driver);
   kfree(lj_state_table);
-  mutex_destroy(&probe_lock);
+  mutex_destroy(&state_table_lock);
   printk(KERN_INFO "Goodbye, kernel!\n");
 }
 
