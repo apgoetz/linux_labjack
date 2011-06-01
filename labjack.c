@@ -33,7 +33,7 @@ static int chr_open(struct inode *inode, struct file *file);
 
 
 static ssize_t achr_read(struct file *file, char __user *buf, 
-		  size_t size, loff_t *off)
+			 size_t size, loff_t *off);
 
 
 static ssize_t cchr_read(struct file *file, char __user *buf, 
@@ -342,7 +342,7 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
   kfree(curstate->hw_lock);
  err_free:
   usb_set_intfdata(intf, NULL);
-  kfree(curstateq);
+  kfree(curstate);
   
  error:
   return -1;
