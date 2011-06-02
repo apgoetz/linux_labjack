@@ -529,9 +529,9 @@ static ssize_t cchr_read(struct file *file, char __user *buf,
 static int __init lj_start(void)
 {
 	int result = 0;
-
+	
 	printk(KERN_INFO "Hello, kernel!\n");
-  
+	mutex_init(&state_table_lock);
 	lj_state_table = kzalloc(sizeof(struct usb_interface*) * MAXDEV, 
 				GFP_KERNEL);
   
@@ -547,7 +547,7 @@ static int __init lj_start(void)
 		printk(KERN_INFO "Could not register device: %d", result);
 		goto error_reg;
 	}
-	mutex_init(&state_table_lock);
+	
 	return 0;
 error_reg:
 	kfree(lj_state_table);
