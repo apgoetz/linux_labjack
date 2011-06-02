@@ -19,6 +19,8 @@
 #define MAXDEV 8		/* max number of connected ljs */
 #define MINOR_START 135		/* start minor number */
 #define LJ_NAMESIZE 20		/* 20 char max for name. */
+#define LJ_PORTC_FREQ (HZ*1)	/* frequency with which to check the airlock */
+
 /* keeps track of usb interfaces that are connected */
 static struct lj_state **lj_state_table = NULL;
 
@@ -351,7 +353,7 @@ static void c_timer_cbk(unsigned long state)
 	WARN_ON(result);
 	
 	/* set up the next interrupt */
-	curstate->c_poll_timer.expires += 1*HZ;
+	curstate->c_poll_timer.expires += LJ_PORTC_FREQ;
 	add_timer(&curstate->c_poll_timer);
 	return;
 }
@@ -458,7 +460,7 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	/* create the portC timer callback */
 	init_timer(&curstate->c_poll_timer);
 
-	curstate->c_poll_timer.expires = jiffies + 1*HZ;
+	curstate->c_poll_timer.expires = jiffies + LJ_PORTC_FREQ;
 	curstate->c_poll_timer.function = c_timer_cbk;
 	curstate->c_poll_timer.data = (unsigned long)curstate;
 	add_timer(&curstate->c_poll_timer);
