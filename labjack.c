@@ -95,6 +95,16 @@ static struct usb_driver usb_driver = {
 };
 
 
+static int was_err(u8 *buf, int len)
+{
+	if (len == 2 &&
+		buf[0] == 0xb8 &&
+		buf[1] == 0xb8){
+		return -1;
+	}
+	return 0;
+}
+
 /* debug function to print an array to /var/log/messages. This is done
    using */
 static void print_arr(u8* data, int size)
@@ -196,6 +206,8 @@ static void fix_checksum16(u8* packet, u16 size)
 
 static void c_urb_in_cbk(struct urb *urb)
 {
+	int rawvoltage;
+	u8 *rcv_packet;
 	if(urb->status && 
 		(urb->status == -ENOENT ||
 			urb->status == -ECONNRESET ||
@@ -209,12 +221,22 @@ static void c_urb_in_cbk(struct urb *urb)
 			urb->status);
 		return;
 	}
+	if (was_err(urb->transfer_buffer, urb->actual_length))
+	{
+		printk(KERN_INFO "There was a checksum error!\n");
+		goto error;
+	}
+
 	printk(KERN_INFO "Successfully submitted portC IN URB\n");
-	print_arr(urb->transfer_buffer, urb->actual_length);
-	printk("\n");
+	rcv_packet = (u8*)urb->transfer_buffer;
+	rawvoltage = rcv_packet[9] + (rcv_packet[10] << 8);
+	printk(KERN_INFO "Raw voltage on EIN2: %d\n", rawvoltage);
+	
+error:
 	kfree(urb->transfer_buffer);
 	usb_free_urb(urb);
 	return;
+
 }
 
 static void c_urb_out_cbk(struct urb *urb)
@@ -242,6 +264,7 @@ static void c_urb_out_cbk(struct urb *urb)
 	curstate = (struct lj_state*)urb->context;
 	
 	rcv_packet = kmalloc(sizeof(u8)*RCVSIZE, GFP_ATOMIC);
+
 	
 	kfree(urb->transfer_buffer);
 	usb_fill_bulk_urb(urb, curstate->usb_device, 
@@ -251,10 +274,10 @@ static void c_urb_out_cbk(struct urb *urb)
 	/* submit the urb */
 	result = usb_submit_urb(urb, GFP_ATOMIC);
 	WARN_ON(result);
-	printk(KERN_INFO "leaving OUT cbk.\n");
+	return;
 }
 
-static void c_poll_cbk(unsigned long state)
+static void c_timer_cbk(unsigned long state)
 {
 	struct lj_state *curstate = (struct lj_state*)state;
 
@@ -273,6 +296,19 @@ static void c_poll_cbk(unsigned long state)
 			" for portC.\n");
 		return;
 	}
+
+	/* 8bit checksum */
+	snd_packet[1] = 0xf8;
+	snd_packet[2] = 0x2; 		/* number of words is .5 + 1.5 */
+	snd_packet[3] = 0x00;
+	/* 16bit checksum */
+	snd_packet[6] = 0x00;		/* echo can be whatever we want */
+	snd_packet[7] = 0x01;		/* Do an analog in */
+	snd_packet[8] = 9;		/* read AIN9 */
+	snd_packet[9] = 31;		/* compare it to gnd */
+
+	fix_checksum16(snd_packet, SNDSIZE);
+
 	
 	urb = usb_alloc_urb(0, GFP_ATOMIC);
 	urb->transfer_flags = 0;
@@ -385,7 +421,7 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	init_timer(&curstate->c_poll_timer);
 
 	curstate->c_poll_timer.expires = jiffies + 1*HZ;
-	curstate->c_poll_timer.function = c_poll_cbk;
+	curstate->c_poll_timer.function = c_timer_cbk;
 	curstate->c_poll_timer.data = (unsigned long)curstate;
 	add_timer(&curstate->c_poll_timer);
 	
@@ -566,7 +602,7 @@ static ssize_t bchr_read(struct file *file, char __user *buf,
 			snd_packet, SNDSIZE, &sent_len, 5);
   
 	if(result){
-		printk(KERN_INFO "Could not successfully send bulk message!\n");
+		printk(KERN_INFO "Could not successfully send bulk message\n");
 		goto error;
 	}
 	else{
