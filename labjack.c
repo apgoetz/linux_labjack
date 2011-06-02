@@ -230,7 +230,13 @@ static void c_urb_in_cbk(struct urb *urb)
 	printk(KERN_INFO "Successfully submitted portC IN URB\n");
 	rcv_packet = (u8*)urb->transfer_buffer;
 	rawvoltage = rcv_packet[9] + (rcv_packet[10] << 8);
-	printk(KERN_INFO "Raw voltage on EIN2: %d\n", rawvoltage);
+
+	if(rawvoltage > 26860){
+		printk(KERN_INFO "EIN2 greater than 1V\n");
+	}
+	else{
+		printk(KERN_INFO "EIN2 less than 1V\n");
+	}
 	
 error:
 	kfree(urb->transfer_buffer);
