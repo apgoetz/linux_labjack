@@ -9,6 +9,7 @@
 #include <linux/mutex.h>
 #include <linux/miscdevice.h>
 #include <asm/uaccess.h>
+#include <linux/timer.h>
 
 #define LJ_VENDOR_ID  0x0CD5
 #define LJ_PRODUCT_ID 0x0003
@@ -76,6 +77,7 @@ struct lj_state {
 	struct miscdevice achr_device;
 	struct miscdevice bchr_device;
 	struct miscdevice cchr_device;
+	struct timer_list c_poll_timer;
 };
 
 static struct usb_device_id id_table [] = {
@@ -192,6 +194,100 @@ static void fix_checksum16(u8* packet, u16 size)
 
 }
 
+static void c_urb_in_cbk(struct urb *urb)
+{
+	if(urb->status && 
+		(urb->status == -ENOENT ||
+			urb->status == -ECONNRESET ||
+			urb->status == -ESHUTDOWN)){			
+		printk(KERN_INFO "unexpected urb unlink in portc IN cbk.\n");
+		/* for some reason we got shutdown. abort. */
+		return;
+	}
+	else if (urb->status){
+		printk(KERN_INFO "Error in portc urb IN cbk: %d.\n", 
+			urb->status);
+		return;
+	}
+	printk(KERN_INFO "Successfully submitted portC IN URB\n");
+	print_arr(urb->transfer_buffer, urb->actual_length);
+	printk("\n");
+	kfree(urb->transfer_buffer);
+	usb_free_urb(urb);
+	return;
+}
+
+static void c_urb_out_cbk(struct urb *urb)
+{
+	u8 *rcv_packet;
+	struct lj_state *curstate;
+	const int RCVSIZE = 12;
+	int result;
+	if(urb->status && 
+		(urb->status == -ENOENT ||
+			urb->status == -ECONNRESET ||
+			urb->status == -ESHUTDOWN)){			
+		printk(KERN_INFO "unexpected urb unlink in portc callback.\n");
+		/* for some reason we got shutdown. abort. */
+		return;
+	}
+	else if (urb->status){
+		printk(KERN_INFO "Error in portc urb out cbk: %d.\n", 
+			urb->status);
+		return;
+	}
+	
+	/* if we are here, we are go for an in URB */
+	printk(KERN_INFO "Successfully submitted portC OUT URB\n");
+	curstate = (struct lj_state*)urb->context;
+	
+	rcv_packet = kmalloc(sizeof(u8)*RCVSIZE, GFP_ATOMIC);
+	
+	kfree(urb->transfer_buffer);
+	usb_fill_bulk_urb(urb, curstate->usb_device, 
+			usb_rcvbulkpipe(curstate->usb_device, 2), 
+			rcv_packet, RCVSIZE, c_urb_in_cbk, curstate);
+	
+	/* submit the urb */
+	result = usb_submit_urb(urb, GFP_ATOMIC);
+	WARN_ON(result);
+	printk(KERN_INFO "leaving OUT cbk.\n");
+}
+
+static void c_poll_cbk(unsigned long state)
+{
+	struct lj_state *curstate = (struct lj_state*)state;
+
+	const int SNDSIZE = 10;
+	u8 *snd_packet = NULL;
+	
+	int result = 0;
+	struct urb *urb;
+	
+
+	printk(KERN_INFO "portC polling timer triggered!\n");
+	snd_packet = kzalloc(sizeof(u8)*SNDSIZE, GFP_ATOMIC);
+	if(!snd_packet)
+	{
+		printk(KERN_INFO "Could not allocate memory for snd_packet"
+			" for portC.\n");
+		return;
+	}
+	
+	urb = usb_alloc_urb(0, GFP_ATOMIC);
+	urb->transfer_flags = 0;
+	usb_fill_bulk_urb(urb, curstate->usb_device, 
+			usb_sndbulkpipe(curstate->usb_device, 1), 
+			snd_packet, SNDSIZE, c_urb_out_cbk, curstate);
+
+	result = usb_submit_urb(urb, GFP_ATOMIC);
+	WARN_ON(result);
+	
+	/* set up the next interrupt */
+	curstate->c_poll_timer.expires += 1*HZ;
+	add_timer(&curstate->c_poll_timer);
+	return;
+}
 
 static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
 {
@@ -246,6 +342,7 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
 		goto err_free;
 	}
   
+
 	mutex_init(curstate->hw_lock);
   
 	usb_set_intfdata(intf, curstate);
@@ -283,7 +380,16 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	}
 
 	devid = minor - MINOR_START;
+	
+	/* create the portC timer callback */
+	init_timer(&curstate->c_poll_timer);
 
+	curstate->c_poll_timer.expires = jiffies + 1*HZ;
+	curstate->c_poll_timer.function = c_poll_cbk;
+	curstate->c_poll_timer.data = (unsigned long)curstate;
+	add_timer(&curstate->c_poll_timer);
+	
+	/* Create the character devices */
 
 	tmpname = kmalloc(sizeof(char)*LJ_NAMESIZE, GFP_KERNEL);
 	sprintf(tmpname, "lab%dportA",devid);
@@ -374,6 +480,7 @@ static  void lj_disconnect(struct usb_interface *intf)
   
 	curstate = usb_get_intfdata(intf);
   
+	del_timer_sync(&curstate->c_poll_timer);
 	minor = curstate->bchr_device.minor;
 	remove_state_table(minor);
   
@@ -426,7 +533,6 @@ static ssize_t bchr_read(struct file *file, char __user *buf,
 	u8 snd_packet[SNDSIZE];
 	u8 rcv_packet[RCVSIZE];
 	int result;
-
 	/* if they don't give us enough space, we have to abort*/
 	if(size < sizeof (int)){
 		return -EINVAL;
