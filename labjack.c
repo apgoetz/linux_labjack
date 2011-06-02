@@ -304,7 +304,7 @@ static void c_timer_cbk(unsigned long state)
 	/* 16bit checksum */
 	snd_packet[6] = 0x00;		/* echo can be whatever we want */
 	snd_packet[7] = 0x01;		/* Do an analog in */
-	snd_packet[8] = 9;		/* read AIN9 */
+	snd_packet[8] = 10;		/* read AIN10 */
 	snd_packet[9] = 31;		/* compare it to gnd */
 
 	fix_checksum16(snd_packet, SNDSIZE);
@@ -348,10 +348,10 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	/* 16bit checksum */
 	config_packet[6] = 15;	/* set everything */
 	config_packet[7] = 0x00;	/* reserved */
-	config_packet[8] = 0x00;	/* no timers */
+	config_packet[8] = 0x40;	/* offset must be at least 4*/
 	config_packet[9] = 0x00;	/* deprecated */
 	config_packet[10] = 0x00;	/* no Analog on FIO */
-	config_packet[12] = 0x02;	/* EIO2 is AIN9 */
+	config_packet[12] = 0x04;	/* EIO2 is AIN10 */
   
 	fix_checksum16(config_packet, CFGSIZE);
   
@@ -406,7 +406,12 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
 		printk("\n");
 		goto err_hwlock;
 	}
-	printk(KERN_INFO "EIN2 configure as AIN9\n");
+	if(rcv_packet[6])
+	{
+		printk("error in configio: %d\n", rcv_packet[6]);
+		goto err_hwlock;
+	}
+	printk(KERN_INFO "EIN2 configure as AIN10: 0x%x\n", rcv_packet[11]);
   
 	minor = insert_state_table(curstate);
 	if(minor < 0){
