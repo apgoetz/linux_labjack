@@ -10,6 +10,7 @@
 #include <linux/miscdevice.h>
 #include <asm/uaccess.h>
 #include <linux/timer.h>
+#include <linux/wait.h>
 
 #define LJ_VENDOR_ID  0x0CD5
 #define LJ_PRODUCT_ID 0x0003
@@ -66,18 +67,27 @@ static struct file_operations cchr_ops = {
 	.open = chr_open,
 };
 
-
+enum airlock_state {air_open, air_closed, air_error};
 
 struct lj_state {
 	/* used to sling messages around through the USB. */
 	struct usb_device *usb_device;
 	/* prevents multiple hardware requests at once, per labjack. */
 	struct mutex *hw_lock;
-  
+	/* miscdevice struct for portA */
 	struct miscdevice achr_device;
+	/* miscdevice struct for portB */
 	struct miscdevice bchr_device;
+	/* miscdevice struct for portC */
 	struct miscdevice cchr_device;
+	/* timer used by portC to check EIN2's voltage at 1Hz */
 	struct timer_list c_poll_timer;
+	/* waitqueue for portC processes that are blocking */
+	wait_queue_head_t c_waitqueue;
+	/* this flag is used to determine whether or not the read
+	 * calls on portC will unblock. Because only one person ever
+	 * writes to this location, we don't need to lock it. */
+	enum airlock_state  airlock;
 };
 
 static struct usb_device_id id_table [] = {
@@ -208,6 +218,8 @@ static void c_urb_in_cbk(struct urb *urb)
 {
 	int rawvoltage;
 	u8 *rcv_packet;
+	struct lj_state *curstate;
+
 	if(urb->status && 
 		(urb->status == -ENOENT ||
 			urb->status == -ECONNRESET ||
@@ -227,15 +239,28 @@ static void c_urb_in_cbk(struct urb *urb)
 		goto error;
 	}
 
-	printk(KERN_INFO "Successfully submitted portC IN URB\n");
 	rcv_packet = (u8*)urb->transfer_buffer;
+	
+	if (rcv_packet[6]){
+		printk(KERN_INFO "There was an error: %d\n", rcv_packet[6]);
+		goto error;
+	}
+
+
+	curstate = (struct lj_state*)urb->context;
+
+	printk(KERN_INFO "Successfully submitted portC IN URB\n");
+	
 	rawvoltage = rcv_packet[9] + (rcv_packet[10] << 8);
 
 	if(rawvoltage > 26860){
 		printk(KERN_INFO "EIN2 greater than 1V\n");
+		curstate->airlock = air_open;
+		wake_up_interruptible(&curstate->c_waitqueue);
 	}
 	else{
 		printk(KERN_INFO "EIN2 less than 1V\n");
+		curstate->airlock = air_closed;
 	}
 	
 error:
@@ -357,10 +382,11 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	config_packet[8] = 0x40;	/* offset must be at least 4*/
 	config_packet[9] = 0x00;	/* deprecated */
 	config_packet[10] = 0x00;	/* no Analog on FIO */
-	config_packet[12] = 0x04;	/* EIO2 is AIN10 */
+	config_packet[11] = 0x04;	/* EIO2 is AIN10 */
   
+
 	fix_checksum16(config_packet, CFGSIZE);
-  
+
 	printk(KERN_INFO "You were probed!!!\n");
 
 	curstate = kzalloc(sizeof(struct lj_state), GFP_KERNEL);
@@ -386,7 +412,9 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
   
 
 	mutex_init(curstate->hw_lock);
-  
+	
+	init_waitqueue_head(&curstate->c_waitqueue);
+	
 	usb_set_intfdata(intf, curstate);
   
 	result = usb_bulk_msg(curstate->usb_device, 
@@ -417,7 +445,6 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
 		printk("error in configio: %d\n", rcv_packet[6]);
 		goto err_hwlock;
 	}
-	printk(KERN_INFO "EIN2 configure as AIN10: 0x%x\n", rcv_packet[11]);
   
 	minor = insert_state_table(curstate);
 	if(minor < 0){
@@ -443,7 +470,7 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	curstate->achr_device.name = tmpname;
 	curstate->achr_device.minor = minor; /* a's minor is start minor*/
 	curstate->achr_device.fops = &achr_ops;
-
+	
 
 	result = misc_register(&curstate->achr_device);
   
@@ -527,6 +554,10 @@ static  void lj_disconnect(struct usb_interface *intf)
   
 	curstate = usb_get_intfdata(intf);
   
+	/* let the portC read syscall know there was an error */
+	curstate->airlock = air_error;
+	wake_up_interruptible(&curstate->c_waitqueue);
+	
 	del_timer_sync(&curstate->c_poll_timer);
 	minor = curstate->bchr_device.minor;
 	remove_state_table(minor);
@@ -669,8 +700,28 @@ static ssize_t achr_read(struct file *file, char __user *buf,
 static ssize_t cchr_read(struct file *file, char __user *buf, 
 			size_t size, loff_t *off)
 {
+	struct lj_state *curstate;
+	int cpysize;
+	char *mesg = "Airlock open!";
+	const int MESG_LEN = 14;
+
 	printk(KERN_INFO "Someone tried to read on portC!\n");
-	return -EINVAL;
+	
+	cpysize = (size < MESG_LEN) ? size : MESG_LEN;
+	curstate = (struct lj_state*)file->private_data;
+	if(wait_event_interruptible(curstate->c_waitqueue, 
+					curstate->airlock != air_closed)){
+		printk(KERN_INFO "error in cchr wait event!\n");
+		return -ERESTARTSYS;
+	}
+	if(curstate->airlock == air_error)
+	{
+		return -ERESTARTSYS;
+	}
+	printk(KERN_INFO "cchar_read woke up!\n");
+	copy_to_user(buf, mesg, cpysize);
+
+	return cpysize;
 }
 
 
