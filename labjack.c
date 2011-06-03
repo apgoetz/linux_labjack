@@ -11,6 +11,8 @@
 #include <asm/uaccess.h>
 #include <linux/timer.h>
 #include <linux/wait.h>
+#include <linux/spinlock.h>
+#include <linux/kernel.h>
 
 #define LJ_VENDOR_ID  0x0CD5
 #define LJ_PRODUCT_ID 0x0003
@@ -75,13 +77,19 @@ struct lj_state {
 	/* used to sling messages around through the USB. */
 	struct usb_device *usb_device;
 	/* prevents multiple hardware requests at once, per labjack. */
-	struct mutex *hw_lock;
+	spinlock_t *hw_lock;
 	/* miscdevice struct for portA */
 	struct miscdevice achr_device;
 	/* miscdevice struct for portB */
 	struct miscdevice bchr_device;
 	/* miscdevice struct for portC */
 	struct miscdevice cchr_device;
+	/* waitqueue used to block portB read syscall until URB completes */
+	wait_queue_head_t b_waitqueue;
+	/* field to hold value of tempurature. 
+	 curtemp == INT_MAX when blocked.
+	 curtemp == -INT_MAX when invalid.*/
+	int curtemp;
 	/* timer used by portC to check EIN2's voltage at 1Hz */
 	struct timer_list c_poll_timer;
 	/* waitqueue for portC processes that are blocking */
@@ -404,7 +412,7 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	curstate->usb_device = usb_device;
 
 	curstate->hw_lock = NULL;
-	curstate->hw_lock = kmalloc(sizeof(struct mutex), GFP_KERNEL);
+	curstate->hw_lock = kmalloc(sizeof(spinlock_t), GFP_KERNEL);
   
 	if(curstate->hw_lock == NULL){
 		printk(KERN_INFO 
@@ -413,10 +421,11 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	}
   
 
-	mutex_init(curstate->hw_lock);
+	spin_lock_init(curstate->hw_lock);
 	
 	init_waitqueue_head(&curstate->c_waitqueue);
-	
+	init_waitqueue_head(&curstate->b_waitqueue);
+
 	usb_set_intfdata(intf, curstate);
   
 	result = usb_bulk_msg(curstate->usb_device, 
@@ -536,7 +545,6 @@ err_rega:
 err_intf:
 	remove_state_table(minor);
 err_hwlock:
-	mutex_destroy(curstate->hw_lock);
 	kfree(curstate->hw_lock);
 err_free:
 	usb_set_intfdata(intf, NULL);
@@ -599,25 +607,136 @@ error:
 	return -1;
 }
 
+
+static void b_urb_in_cbk(struct urb *urb)
+{
+	u8 *rcv_packet;
+	struct lj_state *curstate;
+	int rawtemp;
+	const int KFROMBIN = 13;
+	const int KDIV = 1000;
+
+	curstate = (struct lj_state*)urb->context;
+	rcv_packet = urb->transfer_buffer;
+	if(urb->status && 
+		(urb->status == -ENOENT ||
+			urb->status == -ECONNRESET ||
+			urb->status == -ESHUTDOWN)){			
+		printk(KERN_INFO "unexpected urb unlink in portb IN cbk.\n");
+		/* for some reason we got shutdown. abort. */
+		goto error;
+	}
+	else if (urb->status){
+		printk(KERN_INFO "Error in portb urb in cbk: %d.\n", 
+			urb->status);
+		goto error;
+	}
+	
+	if(was_err(rcv_packet, urb->actual_length)){
+		printk(KERN_INFO "bad checksum in portb in cbk!\n");
+		goto error;
+	}
+	else if (rcv_packet[6]){
+		printk(KERN_INFO "error in portb in cbk: %d", rcv_packet[6]);
+		goto error;
+	}
+
+	/* convert the temperature and store in the curtemp field. */
+	rawtemp = rcv_packet[9] + (rcv_packet[10] << 8);
+	curstate->curtemp = (rawtemp * KFROMBIN) / KDIV;
+	curstate->curtemp -= 273;
+	wake_up_interruptible(&curstate->b_waitqueue);
+	kfree(rcv_packet);
+	return;
+	
+error: 
+	kfree(rcv_packet);
+	curstate->curtemp = -INT_MAX;
+	wake_up_interruptible(&curstate->b_waitqueue);
+	return;
+}
+
+static void b_urb_out_cbk(struct urb *urb)
+{
+	u8 *rcv_packet = NULL;
+	struct lj_state *curstate;
+	const int RCVSIZE = 12;
+	int result;
+	u8 *snd_packet;
+
+	curstate = (struct lj_state*)urb->context;
+	snd_packet = urb->transfer_buffer;	
+	if(urb->status && 
+		(urb->status == -ENOENT ||
+			urb->status == -ECONNRESET ||
+			urb->status == -ESHUTDOWN)){			
+		printk(KERN_INFO "unexpected urb unlink in portb callback.\n");
+		/* for some reason we got shutdown. abort. */
+		goto error;
+	}
+	else if (urb->status){
+		printk(KERN_INFO "Error in portb urb out cbk: %d.\n", 
+			urb->status);
+		goto error;
+	}
+
+	rcv_packet = kmalloc(sizeof(u8)*RCVSIZE, GFP_ATOMIC);
+
+	if(!rcv_packet)
+	{
+		printk(KERN_INFO "Could not allocate memory for rcv!\n");
+		goto error;
+	}
+	
+	usb_fill_bulk_urb(urb, curstate->usb_device,
+			usb_rcvbulkpipe(curstate->usb_device, 2),
+			rcv_packet, RCVSIZE, b_urb_in_cbk, curstate);
+
+	result = usb_submit_urb(urb, GFP_ATOMIC);
+	if(result)
+	{
+		printk("Could not submit portB IN urb!\n");
+		goto err_rcv;
+	}
+
+	kfree(snd_packet);
+	return;
+	
+err_rcv:
+	kfree(rcv_packet);
+error: 
+	kfree(snd_packet);
+	curstate->curtemp = -INT_MAX;
+	wake_up_interruptible(&curstate->b_waitqueue);
+	return;
+}
+
 static ssize_t bchr_read(struct file *file, char __user *buf, 
 			size_t size, loff_t *off)
 {
 	const int SNDSIZE = 10;
-	const int KFROMBIN = 13;
-	const int KDIV = 1000;
-	const int RCVSIZE = 12;
+
 	struct lj_state *lj_state = NULL;
-	int sent_len;
-	int rawtemp;
-	int scaledtemp;
-	u8 snd_packet[SNDSIZE];
-	u8 rcv_packet[RCVSIZE];
+
+	
+	u8 *snd_packet = NULL;
+	struct urb *urb;
 	int result;
+
+	printk(KERN_INFO "Someone tried to read on portb!\n");
+	
 	/* if they don't give us enough space, we have to abort*/
 	if(size < sizeof (int)){
 		return -EINVAL;
 	}
   
+	snd_packet = kmalloc(sizeof(u8)* SNDSIZE, GFP_KERNEL);
+	
+	if(!snd_packet)
+	{
+		printk(KERN_INFO "Could not allocate space for snd_packet!\n");
+		goto error;
+	}
 	/* 8bit checksum */
 	snd_packet[1] = 0xf8;
 	snd_packet[2] = 0x2; 		/* number of words is .5 + 1.5 */
@@ -632,61 +751,45 @@ static ssize_t bchr_read(struct file *file, char __user *buf,
 
 	lj_state = file->private_data;
   
-	printk(KERN_INFO "Someone tried to read on portb!\n"
-		"devnum: %d\n", lj_state->usb_device->devnum);
+	urb = usb_alloc_urb(0, GFP_KERNEL);
+	urb->transfer_flags = 0;
 
-  
-	mutex_lock(lj_state->hw_lock);
-  
+	usb_fill_bulk_urb(urb, lj_state->usb_device, 
+			usb_sndbulkpipe(lj_state->usb_device, 1), 
+			snd_packet, SNDSIZE, b_urb_out_cbk, lj_state);
 	/* in here, this function has unique access to the hardware. */
+	spin_lock(lj_state->hw_lock);
 
-
-	result = usb_bulk_msg(lj_state->usb_device, 
-			usb_sndbulkpipe(lj_state->usb_device, 1),
-			snd_packet, SNDSIZE, &sent_len, 5);
-  
-	if(result){
-		printk(KERN_INFO "Could not successfully send bulk message\n");
-		goto error;
-	}
-	else{
-		printk("Successfully sent bulk message!\n");
+	result = usb_submit_urb(urb, GFP_KERNEL);
+	
+	if(result)
+	{
+		WARN_ON(result);
+		goto err_spin;
 	}
 
-
-	result = usb_bulk_msg(lj_state->usb_device, 
-			usb_rcvbulkpipe(lj_state->usb_device, 2),
-			rcv_packet, RCVSIZE, &sent_len, 5);
-  
-	if(result){
-		printk(KERN_INFO 
-			"Could not successfully receive bulk message!\n");
-		goto error;
-	}
-	else{
-		printk("Successfully received bulk message!\n"
-			"It was %d bytes. \n", sent_len);
+	lj_state->curtemp = INT_MAX;
+	
+	if(wait_event_interruptible(lj_state->b_waitqueue, 
+					lj_state->curtemp != INT_MAX)){
+		printk(KERN_INFO "error in bchr_read: wait interrupted!\n");
+		goto err_spin;
 	}
 
-	if(rcv_packet[6]){
-		printk("but there was an error! data was:\n");
-		print_arr(rcv_packet, RCVSIZE);
-		printk("\n");
+	spin_unlock(lj_state->hw_lock);
+	if(lj_state->curtemp == -INT_MAX){
 		goto error;
 	}
   
-	rawtemp = rcv_packet[9] + (rcv_packet[10] << 8);
-	scaledtemp = (rawtemp * KFROMBIN) / KDIV;
-	scaledtemp -= 273; 		/* convert to celsius */
-	printk("Temp is %d C.\n", scaledtemp);
-	mutex_unlock(lj_state->hw_lock);
-  
-	copy_to_user(buf, &scaledtemp, sizeof(int));
+	copy_to_user(buf, &lj_state->curtemp, sizeof(int));
   
 	return sizeof(int);
-  
+
+	
+err_spin:
+	spin_unlock(lj_state->hw_lock);	
+	kfree(snd_packet);
 error:
-	mutex_unlock(lj_state->hw_lock);
 	return -EINVAL;
 }
 
