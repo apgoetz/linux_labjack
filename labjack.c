@@ -41,6 +41,13 @@ static int chr_open(struct inode *inode, struct file *file);
 static ssize_t achr_read(struct file *file, char __user *buf, 
 			size_t size, loff_t *off);
 
+static int achr_open(struct inode *inode, struct file *file);
+
+static int achr_release(struct inode *inode, struct file *file);
+
+static ssize_t achr_write(struct file * file, const char __user *buf,
+			size_t len, loff_t *offset);
+
 
 static ssize_t cchr_read(struct file *file, char __user *buf, 
 			size_t size, loff_t *off);
@@ -54,7 +61,9 @@ static void lj_disconnect(struct usb_interface *intf);
 static struct file_operations achr_ops = {
 	.owner = THIS_MODULE,
 	.read = achr_read,
-	.open = chr_open,
+	.write = achr_write,
+	.open = achr_open,
+	.release = achr_release
 };
 
 
@@ -804,6 +813,28 @@ static ssize_t achr_read(struct file *file, char __user *buf,
 			size_t size, loff_t *off)
 {
 	printk(KERN_INFO "Someone tried to read on portA!\n");
+	return -EINVAL;
+}
+
+static int achr_open(struct inode *inode, struct file *file)
+{
+	printk(KERN_INFO "Someone tried to open portA!\n");
+	return -EINVAL;
+
+}
+
+static int achr_release(struct inode *inode, struct file *file)
+{
+	printk(KERN_INFO "Someone tried to release portA!\n");
+	return -EINVAL;
+
+}
+
+static ssize_t achr_write(struct file * file, const char __user *buf,
+			size_t len, loff_t *offset)
+{
+
+	printk(KERN_INFO "Someone tried to write on portA!\n");
 	return -EINVAL;
 }
 
