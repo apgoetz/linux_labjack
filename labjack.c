@@ -645,6 +645,7 @@ static void b_urb_in_cbk(struct urb *urb)
 	rawtemp = rcv_packet[9] + (rcv_packet[10] << 8);
 	curstate->curtemp = (rawtemp * KFROMBIN) / KDIV;
 	curstate->curtemp -= 273;
+	spin_unlock(curstate->hw_lock);
 	wake_up_interruptible(&curstate->b_waitqueue);
 	kfree(rcv_packet);
 	return;
@@ -653,6 +654,7 @@ error:
 	kfree(rcv_packet);
 	curstate->curtemp = -INT_MAX;
 	wake_up_interruptible(&curstate->b_waitqueue);
+	spin_unlock(curstate->hw_lock);
 	return;
 }
 
@@ -708,6 +710,7 @@ error:
 	kfree(snd_packet);
 	curstate->curtemp = -INT_MAX;
 	wake_up_interruptible(&curstate->b_waitqueue);
+	spin_unlock(curstate->hw_lock);
 	return;
 }
 
@@ -776,7 +779,7 @@ static ssize_t bchr_read(struct file *file, char __user *buf,
 		goto err_spin;
 	}
 
-	spin_unlock(lj_state->hw_lock);
+
 	if(lj_state->curtemp == -INT_MAX){
 		goto error;
 	}
