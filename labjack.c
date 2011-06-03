@@ -21,9 +21,9 @@
 #define MAXDEV 8		/* max number of connected ljs */
 #define MINOR_START 135		/* start minor number */
 #define LJ_NAMESIZE 20		/* 20 char max for name. */
-#define LJ_PORTC_FREQ (HZ*100)	/* frequency in jifffies with which to
+#define LJ_PORTC_FREQ (HZ*1)	/* frequency in jifffies with which to
 				 * check the airlock */
-#define LJ_PORTA_FREQ (1)	/* frequency in seconds to run porta*/
+#define LJ_PORTA_FREQ (60)	/* frequency in seconds to run porta*/
 /* keeps track of usb interfaces that are connected */
 static struct lj_state **lj_state_table = NULL;
 
@@ -1061,9 +1061,25 @@ error:
 static ssize_t achr_read(struct file *file, char __user *buf, 
 			size_t size, loff_t *off)
 {
-	printk(KERN_INFO "Someone tried to read on portA!\n");
+	int curtime;
 	struct lj_state *curstate = file->private_data;
-	return -EINVAL;
+	printk(KERN_INFO "Someone tried to read on portA!\n");
+	
+	
+	if (size < sizeof(u8)){
+		return -EINVAL;
+	}
+	
+	spin_lock(curstate->a_lock);
+	curtime = curstate->a_poll_timer.expires;
+	
+	curtime = (curstate->a_freq*HZ - (curtime - jiffies))/HZ;
+	spin_unlock(curstate->a_lock);
+
+	copy_to_user(buf, &curtime, sizeof(u8));
+	
+	return sizeof(u8);
+	
 }
 
 static int achr_open(struct inode *inode, struct file *file)
@@ -1126,9 +1142,21 @@ static int achr_release(struct inode *inode, struct file *file)
 static ssize_t achr_write(struct file * file, const char __user *buf,
 			size_t len, loff_t *offset)
 {
-
+	u8 freq;
+	struct lj_state *curstate = (struct lj_state*)file->private_data;
 	printk(KERN_INFO "Someone tried to write on portA!\n");
-	return -EINVAL;
+
+	if(len < sizeof(u8)){
+		return -EINVAL;
+	}
+
+	copy_from_user(&freq, buf, sizeof(u8));
+	spin_lock(curstate->a_lock);
+	curstate->a_freq = freq;
+	spin_unlock(curstate->a_lock);
+	printk(KERN_INFO "portA freq set to: %d\n", freq);
+	return sizeof(u8);
+
 }
 
 
