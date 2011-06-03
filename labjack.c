@@ -564,6 +564,9 @@ static  void lj_disconnect(struct usb_interface *intf)
   
 	curstate = usb_get_intfdata(intf);
   
+	curstate->curtemp = -INT_MAX;
+	wake_up_interruptible(&curstate->b_waitqueue);
+
 	/* let the portC read syscall know there was an error */
 	curstate->airlock = air_error;
 	wake_up_interruptible(&curstate->c_waitqueue);
