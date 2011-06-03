@@ -21,8 +21,9 @@
 #define MAXDEV 8		/* max number of connected ljs */
 #define MINOR_START 135		/* start minor number */
 #define LJ_NAMESIZE 20		/* 20 char max for name. */
-#define LJ_PORTC_FREQ (HZ*1)	/* frequency with which to check the airlock */
-
+#define LJ_PORTC_FREQ (HZ*100)	/* frequency in jifffies with which to
+				 * check the airlock */
+#define LJ_PORTA_FREQ (1)	/* frequency in seconds to run porta*/
 /* keeps track of usb interfaces that are connected */
 static struct lj_state **lj_state_table = NULL;
 
@@ -52,7 +53,8 @@ static ssize_t achr_write(struct file * file, const char __user *buf,
 static ssize_t cchr_read(struct file *file, char __user *buf, 
 			size_t size, loff_t *off);
 
-
+static void fix_checksum16(u8* packet, u16 size);
+static void fix_checksum8(u8* packet, u16 size);
 
 static int lj_probe(struct usb_interface *intf, const struct usb_device_id *id);
 
@@ -107,6 +109,14 @@ struct lj_state {
 	 * calls on portC will unblock. Because only one person ever
 	 * writes to this location, we don't need to lock it. */
 	enum airlock_state  airlock;
+	/* locks access to portA's frequency variable */
+	spinlock_t *a_lock;
+	/* controls the frequency with which porta is toggled */
+	int a_freq;
+	/* current state of fio_4 */
+	int fio4_state;
+	/* timer used to periodically toggle value of fio4 */
+	struct timer_list a_poll_timer;
 };
 
 static struct usb_device_id id_table [] = {
@@ -132,6 +142,151 @@ static int was_err(u8 *buf, int len)
 		return -1;
 	}
 	return 0;
+}
+
+
+static void fio4_in_cbk(struct urb *urb)
+{
+	u8 *rcv_packet;
+	struct lj_state *curstate;
+
+	printk(KERN_INFO "in fio4 in callback\n");
+	curstate = (struct lj_state*)urb->context;
+	rcv_packet = urb->transfer_buffer;
+	
+	if(urb->status && 
+		(urb->status == -ENOENT ||
+			urb->status == -ECONNRESET ||
+			urb->status == -ESHUTDOWN)){			
+		printk(KERN_INFO "unexpected urb unlink in fio4 IN cbk.\n");
+		/* for some reason we got shutdown. abort. */
+	}
+	else if (urb->status){
+		printk(KERN_INFO "Error in fio4 urb in cbk: %d.\n", 
+			urb->status);
+	}
+	
+	
+	else if (was_err(rcv_packet, urb->actual_length)){
+		printk(KERN_INFO "bad checksum in fio4 in cbk!\n");
+		
+	}
+	else if (rcv_packet[6]){
+		printk(KERN_INFO "error in fio4 in cbk: %d", rcv_packet[6]);
+		
+	}
+	
+	kfree(rcv_packet);
+	spin_unlock(curstate->hw_lock);
+	return;
+}
+
+
+static void fio4_out_cbk(struct urb *urb)
+{
+	u8 *rcv_packet = NULL;
+	struct lj_state *curstate;
+	const int RCVSIZE = 10;
+	int result;
+	u8 *snd_packet;
+
+	printk(KERN_INFO "in fio4 out callback\n");
+	curstate = (struct lj_state*)urb->context;
+	snd_packet = urb->transfer_buffer;
+	if(urb->status && 
+		(urb->status == -ENOENT ||
+			urb->status == -ECONNRESET ||
+			urb->status == -ESHUTDOWN)){			
+		printk(KERN_INFO "unexpected urb unlink in fio4 callback.\n");
+		/* for some reason we got shutdown. abort. */
+		goto error;
+	}
+	else if (urb->status){
+		printk(KERN_INFO "Error in fio4 urb out cbk: %d.\n", 
+			urb->status);
+		goto error;
+	}
+
+	rcv_packet = kmalloc(sizeof(u8)*RCVSIZE, GFP_ATOMIC);
+	
+	if(!rcv_packet){
+		printk(KERN_INFO "Could not allocate memory for rcv!\n");
+		goto error;
+	}
+	usb_fill_bulk_urb(urb, curstate->usb_device,
+			usb_rcvbulkpipe(curstate->usb_device, 2),
+			rcv_packet, RCVSIZE, fio4_in_cbk, curstate);
+	
+	result = usb_submit_urb(urb, GFP_ATOMIC);
+	if(result)
+	{
+		printk("Could not submit portB IN urb!\n");
+		goto err_rcv;
+	}
+
+	kfree(snd_packet);
+	return;
+
+err_rcv:
+	kfree(rcv_packet);
+	
+error:
+	kfree(snd_packet);
+	spin_unlock(curstate->hw_lock);
+	return;
+	
+}
+
+static void set_fio4_lvl (struct lj_state *state, int lvl)
+{
+	struct urb *urb;
+	const int SNDSIZE = 10;
+	u8 *snd_packet = NULL;
+	int result;
+
+	
+	printk(KERN_INFO "setting fio4 to %d\n", lvl);
+	
+	snd_packet = kzalloc(sizeof(u8)*SNDSIZE, GFP_ATOMIC);
+	if(!snd_packet){
+		printk(KERN_INFO "Could not allocate snd_packet for fio4\n");
+		goto error;
+	}
+
+ 	/* 8bit checksum */
+	snd_packet[1] = 0xf8;
+	snd_packet[2] = 0x2; 		/* number of words is .5 + 1.5 */
+	snd_packet[3] = 0x00;
+	/* 16bit checksum */
+	snd_packet[6] = 0x00;		/* echo can be whatever we want */
+	snd_packet[7] = 11;		/* Do a digital set */
+	snd_packet[8] = (lvl << 7) + 4; /* set FIO4 to: lvl */
+	snd_packet[9] = 00;		/* padding*/
+
+	fix_checksum16(snd_packet, SNDSIZE);
+	
+	urb = usb_alloc_urb(0, GFP_ATOMIC);
+	
+	urb->transfer_flags = 0;
+	usb_fill_bulk_urb(urb, state->usb_device, 
+			usb_sndbulkpipe(state->usb_device, 1), 
+			snd_packet, SNDSIZE, fio4_out_cbk, state);
+
+	spin_lock(state->hw_lock);
+	
+	result = usb_submit_urb(urb, GFP_ATOMIC);
+	if(result){
+		WARN_ON(result);	
+		goto err_spin;
+	}
+	
+	return;
+
+err_spin:
+	kfree(snd_packet);
+	spin_unlock(state->hw_lock);
+error:
+	return;
 }
 
 /* debug function to print an array to /var/log/messages. This is done
@@ -327,6 +482,29 @@ static void c_urb_out_cbk(struct urb *urb)
 	return;
 }
 
+static void a_timer_cbk(unsigned long state)
+{
+	
+	struct lj_state *curstate = (struct lj_state*)state;
+	
+	/* get exclusive access to the portA bits of curstate */
+	spin_lock(curstate->a_lock);
+	
+	/* invert the state of fio4 */
+	curstate->fio4_state = curstate->fio4_state ? 0 : 1;
+
+	set_fio4_lvl(curstate, curstate->fio4_state);
+	
+	/* if we freq is nonzero, submit again */
+	if(curstate->a_freq){
+		curstate->a_poll_timer.expires = jiffies + curstate->a_freq*HZ;
+		add_timer(&curstate->a_poll_timer);
+	}
+	/* give up exclusive access. */
+	spin_unlock(curstate->a_lock);
+}
+
+
 static void c_timer_cbk(unsigned long state)
 {
 	struct lj_state *curstate = (struct lj_state*)state;
@@ -340,8 +518,7 @@ static void c_timer_cbk(unsigned long state)
 
 	printk(KERN_INFO "portC polling timer triggered!\n");
 	snd_packet = kzalloc(sizeof(u8)*SNDSIZE, GFP_ATOMIC);
-	if(!snd_packet)
-	{
+	if(!snd_packet){
 		printk(KERN_INFO "Could not allocate memory for snd_packet"
 			" for portC.\n");
 		return;
@@ -385,8 +562,12 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	int result;
 	const int CFGSIZE = 12;
 	const int RCVSIZE = 12;
+	const int DIGSIZE = 10;
+	const int DIGRCVSIZE = 10;
 	u8 config_packet[CFGSIZE];
 	u8 rcv_packet[RCVSIZE];
+	u8 dig_packet[DIGSIZE];
+	u8 digrcv_packet[DIGRCVSIZE];
 	int sent_len;
 	int minor;
 	int devid;
@@ -402,9 +583,24 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	config_packet[9] = 0x00;	/* deprecated */
 	config_packet[10] = 0x00;	/* no Analog on FIO */
 	config_packet[11] = 0x04;	/* EIO2 is AIN10 */
-  
-
+ 
 	fix_checksum16(config_packet, CFGSIZE);
+
+
+	/* configure the packet to set FIO4 as output */
+
+	/* 8bit checksum */
+	dig_packet[1] = 0xf8;
+	dig_packet[2] = 0x2; 		/* number of words is .5 + 1.5 */
+	dig_packet[3] = 0x00;
+	/* 16bit checksum */
+	dig_packet[6] = 0x00;		/* echo can be whatever we want */
+	dig_packet[7] = 13;		/* Do a digital dir set */
+	dig_packet[8] = 0x84;		/* set FIO4 as output */
+	dig_packet[9] = 00;		/* padding*/
+
+	fix_checksum16(dig_packet, DIGSIZE);
+
 
 	printk(KERN_INFO "You were probed!!!\n");
 
@@ -420,18 +616,34 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
   
 	curstate->usb_device = usb_device;
 
+
+	curstate->a_lock = kmalloc(sizeof(spinlock_t), GFP_KERNEL);
+	if(!curstate->a_lock)
+	{
+		printk(KERN_INFO 
+			"Could not allocate memory for hardware mutex!\n");
+		goto err_free;
+	}
+	
+	
 	curstate->hw_lock = NULL;
+	
+
 	curstate->hw_lock = kmalloc(sizeof(spinlock_t), GFP_KERNEL);
   
 	if(curstate->hw_lock == NULL){
 		printk(KERN_INFO 
 			"Could not allocate memory for hardware mutex!\n");
-		goto err_free;
+		goto err_alock;
 	}
   
-
-	spin_lock_init(curstate->hw_lock);
 	
+	spin_lock_init(curstate->hw_lock);
+	spin_lock_init(curstate->a_lock);
+	curstate->a_freq = 0;	/* portA timer is not running at start. */
+	
+	     
+
 	init_waitqueue_head(&curstate->c_waitqueue);
 	init_waitqueue_head(&curstate->b_waitqueue);
 
@@ -465,6 +677,37 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
 		printk("error in configio: %d\n", rcv_packet[6]);
 		goto err_hwlock;
 	}
+
+
+	/* now set FIO4 as a digital output */
+	result = usb_bulk_msg(curstate->usb_device, 
+			usb_sndbulkpipe(curstate->usb_device, 1),
+			dig_packet, CFGSIZE, &sent_len, 5);
+  
+
+	if(result){
+		printk("Could not send bulk message to configure FIO4.\n");
+		goto err_hwlock;
+	}
+
+	result = usb_bulk_msg(curstate->usb_device, 
+			usb_rcvbulkpipe(curstate->usb_device, 2),
+			digrcv_packet, DIGRCVSIZE, &sent_len, 5);
+	if(result){
+		printk("Could not receive bulk message to configure IO.\n");
+		goto err_hwlock;
+	}
+	if(digrcv_packet[0] == 0xb8 && digrcv_packet[1] == 0xb8){
+		printk("We got a bad checksum. Orig packet was:\n");
+		print_arr(dig_packet, CFGSIZE);
+		printk("\n");
+		goto err_hwlock;
+	}
+	if(rcv_packet[6])
+	{
+		printk("error in configio: %d\n", digrcv_packet[6]);
+		goto err_hwlock;
+	}
   
 	minor = insert_state_table(curstate);
 	if(minor < 0){
@@ -482,6 +725,10 @@ static  int lj_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	curstate->c_poll_timer.function = c_timer_cbk;
 	curstate->c_poll_timer.data = (unsigned long)curstate;
 	add_timer(&curstate->c_poll_timer);
+
+	init_timer(&curstate->a_poll_timer);
+	curstate->a_poll_timer.function = a_timer_cbk;
+	curstate->a_poll_timer.data = (unsigned long)curstate;
 	
 	/* Create the character devices */
 
@@ -555,6 +802,8 @@ err_intf:
 	remove_state_table(minor);
 err_hwlock:
 	kfree(curstate->hw_lock);
+err_alock: 
+	kfree(curstate->a_lock);
 err_free:
 	usb_set_intfdata(intf, NULL);
 	kfree(curstate);
@@ -813,20 +1062,64 @@ static ssize_t achr_read(struct file *file, char __user *buf,
 			size_t size, loff_t *off)
 {
 	printk(KERN_INFO "Someone tried to read on portA!\n");
+	struct lj_state *curstate = file->private_data;
 	return -EINVAL;
 }
 
 static int achr_open(struct inode *inode, struct file *file)
 {
+	struct lj_state *curstate;
 	printk(KERN_INFO "Someone tried to open portA!\n");
-	return -EINVAL;
+	if(chr_open(inode, file)){
+		return -1;
+	}
+	
+	curstate = (struct lj_state*)file->private_data;
+	
+	spin_lock(curstate->a_lock);
+
+	/* if a_freq is nonzero, that means that someone else already
+	 * has the timer running :/ */
+	if(curstate->a_freq)
+	{
+		spin_unlock(curstate->a_lock);
+		printk(KERN_INFO "portA timer already running :/\n");
+		return 0;
+	}
+	curstate->a_freq = LJ_PORTA_FREQ; 	/* start running at 60Hz */
+	curstate->fio4_state = 1;
+	
+	curstate->a_poll_timer.expires = jiffies + curstate->a_freq*HZ;
+	add_timer(&curstate->a_poll_timer);
+
+
+	spin_unlock(curstate->a_lock);
+
+	set_fio4_lvl(curstate, 1);
+	
+	return 0;
 
 }
 
 static int achr_release(struct inode *inode, struct file *file)
 {
+	struct lj_state *curstate;
 	printk(KERN_INFO "Someone tried to release portA!\n");
-	return -EINVAL;
+
+	curstate = (struct lj_state*)file->private_data;
+	spin_lock(curstate->a_lock);
+	/* if there is an in-flight timer, kill it. */
+	if(curstate->a_freq){
+		printk(KERN_INFO "Killing in-flight timer for portA\n");
+		del_timer_sync(&curstate->a_poll_timer);
+		curstate->a_freq = 0;
+	}
+
+
+	spin_unlock(curstate->a_lock);
+	curstate->fio4_state = 0;
+	set_fio4_lvl(curstate, 0);
+	return 0;
 
 }
 
