@@ -1,0 +1,145 @@
+<2011-05-25 Wed 03:59> Started working on the project. Will try to
+reset the device remotely first.
+
+<2011-05-26 Thu 16:06> Got the hardware to be detected! I can call
+pretty printks when hardware is inserted. Will now try to reset the
+device when it is probed.
+
+<2011-05-26 Thu 17:20> I detected the endpoints today, and can verify
+that they match the results in the the data sheet, as well as the
+output from lsusb.
+
+
+<2011-05-28 Sat 03:02> Successfully reset the device via usb. Now I
+need to architect the driver, and then development can start!
+
+<2011-05-28 Sat 06:41> I was able to to a read from the labjack
+character device, and have it hit the device!! Now I just need to get
+it to return info!
+
+<2011-05-29 Sun 01:43> In order to prevent the different character
+devices from stepping on each other while they try to access the USB
+device, I will add a lock to the software that accesses the usb
+hardware.
+
+<2011-05-29 Sun 04:10> Got the device to tell me the
+temperature. Converted to kelvin using fixed point arithmetic. Will
+now implement the bit that passes this value back to userspace.
+
+<2011-05-29 Sun 04:20> Implemented portB completely. Can now get
+temperature from device.  Next, I will implement portC.
+
+<2011-06-01 Wed 01:06> In order to implement the blocking features of
+portC, I will need to use a workqueue. This will allow an arbitrary
+number of processes to block on reading portC until the device is at
+the correct voltage. First I will implement the code that provides the
+backend for portC. Then I will add the code that polls AIN's voltage.
+Lastly, I will add the code that blocks and reopens the read call for
+portC.
+
+<2011-06-01 Wed 02:08> In order to implement multiple character
+devices at once, I cannot use the usb_register_dev() function, as it
+only supports one character device per file. Instead, I will use the
+miscdevice interface, which will automatically create the /dev entries
+for me. The downside is that I will need to write my own code to
+handle handing out minor numbers, but that should not be too much of a
+problem (hopefully).
+
+<2011-06-01 Wed 03:48>I have a usable way to keep track of minor
+numbers, and to assign the right data to the right place:
+
+There is now an array of pointers to lj_state structures in the
+driver. An lj_state struct contains all of the info necessary to
+communicate to hardware, and to userspace for a single labjack. When a
+new labjack is plugged in, the driver looks for an open space in the
+state_table structure, and calculates a minor number based on the
+index into this array of lj_states. Each port gets its own minor
+number, so each labjack gets three minor numbers.
+
+In the open syscall on any of these minors, the driver converts the
+minor number of the character device opened into an lj_state object in
+the table, and sets this as the private_data field of the file struct.
+This private data field will then be used in the read and write
+syscalls to access the lj_state of a particular labjack.
+
+
+<2011-06-02 Thu 02:48> Unfortunately, the usb_bulk_msg() function I
+have been using cannot be called from an atomic context. This means
+that it cannot be used insided a spinlock or inside a timer. This
+means that the timer callback for portC will have to use a raw URB to
+talk to the hardware.
+
+The timer callback will make an URB to request the AIN.  The
+completion callback for the first URB will make a URB to read in the
+resulting data. Depending on the value of the returned AIN reading,
+the waitqueues might or might not be unblocked.
+
+
+<2011-06-02 Thu 04:51> I got the portC code to dump polls of EIN2
+every second. I don't know if the values it is giving make sense, so I
+need to make some checks. 
+
+<2011-06-02 Thu 05:13>In order to configure the analog inputs, you
+apparently also need to configure the timercounteroffset
+field. Because I wasn't setting a valid value here, EIN2 was not being
+set as an analog input, and I wasn't getting expected results on the
+read. However, now that I fixed this bug, convincing analog values
+(complete with noise!) in the kernel log.
+
+The next step is to implement the character device half of portC,
+complete with the blocking bits. 
+
+<2011-06-02 Thu 07:07> The Labjack documentation says that for the AIN
+single-ended inputs, there are 3.7231e-5 Volts per bit. This means
+that 1.0V should be represented as 26859.3376487, or 26860. 
+
+<2011-06-02 Thu 07:24> I verified that the AIN code is working by
+hooking up the labjack to a lab power supply. I also learned that VS
+on the labjack is 5v, which does weird things to AIN :P
+
+<2011-06-02 Thu 08:33>Fixed a strange bug in the code: The voltage
+returned be the portC timer callback was garbage if the labjack was
+plugged in after the driver was loaded, but worked fine if the labjack
+was plugged in before the driver was loaded. Turns out that the AIN
+specification for EIN2 was accidentally writing off the end of the
+buffer, and the pre-allocated values for the correct location only
+allowed the driver to work if the probe function was called when the
+module was loaded.
+
+<2011-06-02 Thu 08:54>portC is finished! turns out that the condition
+for the waitqueue needs to become true in order for the thread to
+unblock, so I added a state variable to the lj_state structure in
+order to determine whether the airlock is open, closed, or in error.
+
+<2011-06-02 Thu 09:02>I added a macro to define the frequency with
+which the 'airlock' is checked. If the graders complain about the
+latency of the portC read syscall, they can tweak the code to a
+smaller value, such as HZ/2.
+
+
+<2011-06-03 Fri 03:19>
+I moved portB to the urb style execution, and modified it to use hwlock.
+
+<2011-06-03 Fri 12:46>
+The next goal is to implement portA
+On an open call, the voltage on FIO4 needs to start toggling
+Writes change the frequency, and reads return the time since an update.
+The close call needs to set the output to 0 volts. 
+
+I need to do a feedback command in the probe() function to set FIO4 as
+an output.
+
+I will write a function set_fio4_lvl() that takes an lj_state and a
+level, and sets it to that value.
+
+
+<2011-06-03 Fri 14:57> I got the timer working and toggling the led!
+now all i need to do is implement the read and write operations on
+porta.
+
+if porta is read, it returns a single byte containing the number of
+seconds since the scrubber was toggled.  it can be written with a 1
+byte unsigned value, this changes cycle time to the give value.
+
+<2011-06-03 Fri 15:24>
+All finished! now I just need to go over the documentation :P.
